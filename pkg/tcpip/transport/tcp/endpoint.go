@@ -2607,16 +2607,25 @@ func (e *Endpoint) shutdownLocked(flags tcpip.ShutdownFlags) tcpip.Error {
 		return nil
 	case e.EndpointState() == StateListen:
 		if e.shutdownFlags&tcpip.ShutdownRead != 0 {
-			// Reset all connections from the accept queue and keep the
-			// worker running so that it can continue handling incoming
-			// segments by replying with RST.
-			//
-			// By not removing this endpoint from the demuxer mapping, we
-			// ensure that any other bind to the same port fails, as on Linux.
+			// Reset all connections from the accept queue and mark the
+			// listener as shutdown for reading. The bound port remains
+			// reserved until close(), but the endpoint may be removed
+			// from the demuxer below.
 			e.rcvQueueMu.Lock()
 			e.RcvClosed = true
 			e.rcvQueueMu.Unlock()
 			e.closePendingAcceptableConnectionsLocked()
+
+			// Unregister from the demuxer so that another socket
+			// binding to the same port (with SO_REUSEADDR) can
+			// successfully register with the demuxer. Keep the
+			// port reservation intact so that close() still owns
+			// and later releases the bound port.
+			if e.isRegistered {
+				e.stack.UnregisterTransportEndpoint(e.effectiveNetProtos, ProtocolNumber, e.TransportEndpointInfo.ID, e, e.boundPortFlags, e.boundBindToDevice)
+				e.isRegistered = false
+			}
+
 			// Notify waiters that the endpoint is shutdown.
 			e.waiterQueue.Notify(waiter.ReadableEvents | waiter.WritableEvents | waiter.EventHUp | waiter.EventErr)
 		}
@@ -2656,6 +2665,13 @@ func (e *Endpoint) listen(backlog int) tcpip.Error {
 
 		if e.acceptQueue.pendingEndpoints == nil {
 			e.acceptQueue.pendingEndpoints = make(map[*Endpoint]struct{})
+		}
+
+		if !e.isRegistered {
+			if err := e.stack.RegisterTransportEndpoint(e.effectiveNetProtos, ProtocolNumber, e.TransportEndpointInfo.ID, e, e.boundPortFlags, e.boundBindToDevice); err != nil {
+				return err
+			}
+			e.isRegistered = true
 		}
 
 		e.shutdownFlags = 0

@@ -2752,6 +2752,60 @@ TEST_P(SimpleTcpSocketTest, SetUnsupportedPMTUDISC) {
               SyscallSucceeds());
 }
 
+// After shutting down a listening socket, another socket should be able to
+// bind to the same port with SO_REUSEADDR. This matches Linux behavior where
+// tcp_disconnect() calls unhash() to remove the socket from the listening hash.
+TEST_P(SimpleTcpSocketTest, ShutdownListenerAllowsReuseAddrRebind) {
+  FileDescriptor listener =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(GetParam(), SOCK_STREAM, IPPROTO_TCP));
+
+  // Enable SO_REUSEADDR on the listener.
+  int on = 1;
+  ASSERT_THAT(
+      setsockopt(listener.get(), SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)),
+      SyscallSucceeds());
+
+  // Bind to an ephemeral port.
+  sockaddr_storage addr = {};
+  if (GetParam() == AF_INET) {
+    auto* addr4 = reinterpret_cast<sockaddr_in*>(&addr);
+    addr4->sin_family = AF_INET;
+    addr4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr4->sin_port = 0;
+  } else {
+    auto* addr6 = reinterpret_cast<sockaddr_in6*>(&addr);
+    addr6->sin6_family = AF_INET6;
+    addr6->sin6_addr = in6addr_loopback;
+    addr6->sin6_port = 0;
+  }
+  socklen_t addrlen = (GetParam() == AF_INET) ? sizeof(sockaddr_in)
+                                               : sizeof(sockaddr_in6);
+  ASSERT_THAT(bind(listener.get(), reinterpret_cast<sockaddr*>(&addr), addrlen),
+              SyscallSucceeds());
+
+  // Get the assigned port.
+  ASSERT_THAT(
+      getsockname(listener.get(), reinterpret_cast<sockaddr*>(&addr), &addrlen),
+      SyscallSucceeds());
+
+  ASSERT_THAT(listen(listener.get(), 5), SyscallSucceeds());
+
+  // Shutdown the listener (but don't close it).
+  ASSERT_THAT(shutdown(listener.get(), SHUT_RDWR), SyscallSucceeds());
+
+  // Create a new socket and try to bind to the same port with SO_REUSEADDR.
+  FileDescriptor new_listener =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(GetParam(), SOCK_STREAM, IPPROTO_TCP));
+  ASSERT_THAT(setsockopt(new_listener.get(), SOL_SOCKET, SO_REUSEADDR, &on,
+                         sizeof(on)),
+              SyscallSucceeds());
+
+  // This should succeed, not fail with EADDRINUSE.
+  EXPECT_THAT(bind(new_listener.get(), reinterpret_cast<sockaddr*>(&addr),
+                   addrlen),
+              SyscallSucceeds());
+}
+
 INSTANTIATE_TEST_SUITE_P(AllInetTests, SimpleTcpSocketTest,
                          ::testing::Values(AF_INET, AF_INET6));
 
